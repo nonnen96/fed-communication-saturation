@@ -1,33 +1,27 @@
-# 1) Scrape index des pages annuelles (Selenium)
+# fed_speeches_all_in_one.py (no-Selenium)
+# 1) Scrape index des pages annuelles (Requests + BS4)
 # 2) Télécharge chaque discours, extrait le texte complet et compte les mots (Requests + BS4)
 # 3) Écrit: fed_index.csv et fed_speeches_full.csv (avec reprise)
 
 from __future__ import annotations
 
-import csv, os, re, time, random
+import csv, re, time, random
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 import requests
 from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# ----------- Config -----------
 BASE = "https://www.federalreserve.gov"
 YEAR_URL = BASE + "/newsevents/speech/{year}-speeches.htm"
 
 CURRENT_YEAR = datetime.today().year
-MIN_YEAR = CURRENT_YEAR - 8         
-YEAR_START, YEAR_END = CURRENT_YEAR, max(CURRENT_YEAR-30, 1996)  
+MIN_YEAR = CURRENT_YEAR - 8                 # 5–8 ans -> on prend 8
+YEAR_START, YEAR_END = CURRENT_YEAR, max(CURRENT_YEAR-30, 1996)
 
 OUT_DIR = Path.home() / "fed_project" / "processed"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -36,18 +30,21 @@ FULL_CSV  = OUT_DIR / "fed_speeches_full.csv"
 
 REPROCESS_IF_WC_LT = 150
 
-SPEECH_URL_RE = re.compile(r"/newsevents/speech/[a-z0-9-]*\d{8}[a-z]?\.htm$", re.I)
-DATE_MMDDYYYY = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
+# ----------- HTTP robuste -----------
+def make_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "KHTML, like Gecko) Chrome/126 Safari/537.36")
+    })
+    retry = Retry(total=5, backoff_factor=0.5,
+                  status_forcelist=(429,500,502,503,504),
+                  allowed_methods=("GET",))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    return s
 
-def make_driver():
-    opts = Options()
-    # opts.add_argument("--headless=new")     
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36")
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=opts)
-
+# ----------- Utils communs -----------
 def write_rows(path: Path, rows, header):
     if not rows: return
     file_exists = path.exists()
@@ -56,6 +53,12 @@ def write_rows(path: Path, rows, header):
         if not file_exists:
             w.writeheader()
         w.writerows(rows)
+
+SPEECH_URL_RE = re.compile(r"/newsevents/speech/[a-z0-9-]*\d{8}[a-z]?\.htm$", re.I)
+DATE_MMDDYYYY = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
+FOOTNOTE_ANCHOR = re.compile(r"^fn\d+$", re.I)
+WS_RE   = re.compile(r"\s+")
+WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9’']+")
 
 def parse_date_from_text(txt: str):
     m = DATE_MMDDYYYY.search(txt or "")
@@ -87,81 +90,6 @@ def extract_speaker_from_block(text_block: str):
             return ln.strip()
     return ""
 
-def nearest_container(a_el):
-    XPATHS = [
-        "./ancestor::li[1]",
-        "./ancestor::div[contains(@class,'row')][1]",
-        "./ancestor::article[1]",
-        "./parent::div"
-    ]
-    for xp in XPATHS:
-        try:
-            c = a_el.find_element(By.XPATH, xp)
-            if c and c.text.strip():
-                return c
-        except:
-            pass
-    return a_el
-
-def extract_year_index(driver, year: int, seen_urls: set):
-    url = YEAR_URL.format(year=year)
-    print(f"[index {year}] {url}")
-    driver.get(url)
-
-    wait = WebDriverWait(driver, 20)
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a")))
-    time.sleep(0.4)
-
-    anchors = driver.find_elements(By.CSS_SELECTOR, "a[href^='/newsevents/speech/'][href$='.htm']")
-    rows, new_count = [], 0
-
-    for a in anchors:
-        try:
-            href = a.get_attribute("href") or ""
-            if not SPEECH_URL_RE.search(href):
-                continue
-            if href in seen_urls:
-                continue
-
-            title = (a.text or a.get_attribute("title") or "").strip()
-            cont = nearest_container(a)
-            ctx = cont.text if cont else ""
-
-            date_str = parse_date_from_text(ctx) or date_from_url(href)
-            speaker  = extract_speaker_from_block(ctx)
-
-            rows.append({
-                "date": date_str,
-                "title": title,
-                "speaker": speaker,
-                "url": href if href.startswith("http") else urljoin(BASE, href)
-            })
-            seen_urls.add(href)
-            new_count += 1
-        except:
-            continue
-
-    print(f"  +{new_count} new links")
-    return rows
-
-def make_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0 Safari/537.36")
-    })
-    retry = Retry(total=5, backoff_factor=0.5,
-                  status_forcelist=(429,500,502,503,504),
-                  allowed_methods=("GET",))
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://",  HTTPAdapter(max_retries=retry))
-    return s
-
-WS_RE   = re.compile(r"\s+")
-WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9’']+")
-FOOTNOTE_ANCHOR = re.compile(r"^fn\d+$", re.I)
-
 def clean_text(t:str) -> str:
     return WS_RE.sub(" ", t).strip()
 
@@ -186,7 +114,7 @@ def _score_candidate(div: Tag) -> int:
     return score
 
 def _pick_main_body(root: Tag) -> Tag:
-    candidates = []
+    candidates, seen = [], set()
     selectors = [
         "#content div.col-xs-12.col-sm-8.col-md-8",
         "#content div.col-sm-8.col-md-8",
@@ -197,7 +125,6 @@ def _pick_main_body(root: Tag) -> Tag:
         "div.col-sm-8",
         "article",
     ]
-    seen = set()
     for sel in selectors:
         for div in root.select(sel):
             if id(div) in seen: 
@@ -222,7 +149,7 @@ def extract_transcript(html: str) -> str:
         if _good_para_text(txt):
             parts.append(txt)
 
-    if not parts:  
+    if not parts:  # fallback pour pages atypiques
         for p in body.find_all("p", recursive=True):
             if stop and (p is stop or stop in p.parents):
                 break
@@ -237,11 +164,12 @@ def extract_transcript(html: str) -> str:
     text = re.sub(r"\s*\(\d+\)\s*", " ", text)
     return clean_text(text)
 
+# ----------- Étape 1 : INDEX (requests+bs4, pas de Selenium) -----------
 def build_index() -> list[dict]:
-    """Scrape les pages annuelles et écrit fed_index.csv (avec reprise)."""
     print(f"→ Building index into {INDEX_CSV}")
-    driver = make_driver()
+    s = make_session()
 
+    # reprise: éviter doublons si relance
     seen_urls = set()
     if INDEX_CSV.exists():
         with open(INDEX_CSV, "r", encoding="utf-8") as f:
@@ -253,30 +181,57 @@ def build_index() -> list[dict]:
     for year in range(YEAR_START, YEAR_END - 1, -1):
         if year < MIN_YEAR:
             break
-        rows = extract_year_index(driver, year, seen_urls)
 
-        keep = []
-        for r in rows:
-            if r["date"]:
+        url = YEAR_URL.format(year=year)
+        print(f"[index {year}] {url}")
+        r = s.get(url, timeout=20); r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        anchors = soup.select("a[href^='/newsevents/speech/'][href$='.htm']")
+        rows, new_count = [], 0
+
+        for a in anchors:
+            href = a.get("href","")
+            if not SPEECH_URL_RE.search(href):
+                continue
+            abs_url = href if href.startswith("http") else urljoin(BASE, href)
+            if abs_url in seen_urls:
+                continue
+
+            title = a.get_text(strip=True) or (a.get("title") or "")
+            # remonter à un conteneur pertinent pour date/speaker
+            container = a
+            for _ in range(5):
+                if not container: break
+                if container.name in ("li","article") or ("row" in (container.get("class") or [])): break
+                container = container.parent
+            ctx = container.get_text("\n", strip=True) if container else ""
+
+            date_str = parse_date_from_text(ctx) or date_from_url(href)
+            speaker  = extract_speaker_from_block(ctx)
+
+            row = {"date": date_str, "title": title, "speaker": speaker, "url": abs_url}
+            # filtre cutoff année si possible
+            if date_str:
                 try:
-                    if datetime.strptime(r["date"], "%Y-%m-%d").year >= MIN_YEAR:
-                        keep.append(r)
+                    if datetime.strptime(date_str, "%Y-%m-%d").year < MIN_YEAR:
+                        continue
                 except:
-                    keep.append(r)
-            else:
-                keep.append(r)
+                    pass
 
-        write_rows(INDEX_CSV, keep, header=["date","title","speaker","url"])
-        total += len(keep)
-        time.sleep(random.uniform(0.6, 1.2))
+            rows.append(row); seen_urls.add(abs_url); new_count += 1
 
-    driver.quit()
-    print(f"Index done. +{total} rows written.")
+        write_rows(INDEX_CSV, rows, header=["date","title","speaker","url"])
+        total += len(rows)
+        print(f"  +{new_count} new links (total index {total})")
+        time.sleep(random.uniform(0.3, 0.7))
+
+    print("Index done.")
     with open(INDEX_CSV, "r", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
+# ----------- Étape 2 : FULL (texte + word_count) -----------
 def build_full(index_rows: list[dict]):
-    """Télécharge les discours & écrit fed_speeches_full.csv (reprise intelligente)."""
     print(f"→ Building full into {FULL_CSV}")
     done_ok, redo = set(), set()
     if FULL_CSV.exists():
@@ -315,6 +270,7 @@ def build_full(index_rows: list[dict]):
             resp.raise_for_status()
             text = extract_transcript(resp.text)
             wc = count_words(text)
+
             row = {
                 "date": r.get("date",""),
                 "title": r.get("title",""),
@@ -344,13 +300,10 @@ def build_full(index_rows: list[dict]):
 
     print(f"Full done. New/updated rows: {total}")
 
+# ----------- Main -----------
 def main():
-    # Étape 1 — index (Selenium)
     index_rows = build_index()
-
-    # Étape 2 — textes (Requests + BS4)
     build_full(index_rows)
-
     print(f"\nCSV index   → {INDEX_CSV}")
     print(f"CSV full    → {FULL_CSV}")
 
