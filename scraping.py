@@ -1,4 +1,3 @@
-# fed_speeches_all_in_one.py
 # 1) Scrape index des pages annuelles (Selenium)
 # 2) Télécharge chaque discours, extrait le texte complet et compte les mots (Requests + BS4)
 # 3) Écrit: fed_index.csv et fed_speeches_full.csv (avec reprise)
