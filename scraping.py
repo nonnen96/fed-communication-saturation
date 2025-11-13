@@ -1,6 +1,3 @@
-# 1) Scrape index des pages annuelles (Selenium)
-# 2) Télécharge chaque discours, extrait le texte complet et compte les mots (Requests + BS4)
-# 3) Écrit: fed_index.csv et fed_speeches_full.csv (avec reprise)
 
 from __future__ import annotations
 
@@ -22,18 +19,21 @@ from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# --- DATES TO CONFIGURE MANUALLY ---
+# Enter the desired start date here (Year, Month, Day)
+START_DATE = datetime(2011, 11, 1) 
+# Enter the desired end date here
+END_DATE = datetime(2025, 11, 1)
+# --- END OF CONFIGURATION ---
+
+
 BASE = "https://www.federalreserve.gov"
 YEAR_URL = BASE + "/newsevents/speech/{year}-speeches.htm"
 
-CURRENT_YEAR = datetime.today().year
-MIN_YEAR = CURRENT_YEAR - 8         
-YEAR_START, YEAR_END = CURRENT_YEAR, max(CURRENT_YEAR-30, 1996)  
+OUT_DIR = Path.cwd()
+FULL_CSV  = OUT_DIR / "fed_speeches.csv"
 
-OUT_DIR = Path.home() / "fed_project" / "processed"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-INDEX_CSV = OUT_DIR / "fed_index.csv"
-FULL_CSV  = OUT_DIR / "fed_speeches_full.csv"
-
+# If a speech has fewer than 150 words, it will be reprocessed on the next run
 REPROCESS_IF_WC_LT = 150
 
 SPEECH_URL_RE = re.compile(r"/newsevents/speech/[a-z0-9-]*\d{8}[a-z]?\.htm$", re.I)
@@ -41,7 +41,7 @@ DATE_MMDDYYYY = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
 
 def make_driver():
     opts = Options()
-    # opts.add_argument("--headless=new")     
+    opts.add_argument("--headless=new")     
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36")
@@ -102,47 +102,6 @@ def nearest_container(a_el):
         except:
             pass
     return a_el
-
-def extract_year_index(driver, year: int, seen_urls: set):
-    url = YEAR_URL.format(year=year)
-    print(f"[index {year}] {url}")
-    driver.get(url)
-
-    wait = WebDriverWait(driver, 20)
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a")))
-    time.sleep(0.4)
-
-    anchors = driver.find_elements(By.CSS_SELECTOR, "a[href^='/newsevents/speech/'][href$='.htm']")
-    rows, new_count = [], 0
-
-    for a in anchors:
-        try:
-            href = a.get_attribute("href") or ""
-            if not SPEECH_URL_RE.search(href):
-                continue
-            if href in seen_urls:
-                continue
-
-            title = (a.text or a.get_attribute("title") or "").strip()
-            cont = nearest_container(a)
-            ctx = cont.text if cont else ""
-
-            date_str = parse_date_from_text(ctx) or date_from_url(href)
-            speaker  = extract_speaker_from_block(ctx)
-
-            rows.append({
-                "date": date_str,
-                "title": title,
-                "speaker": speaker,
-                "url": href if href.startswith("http") else urljoin(BASE, href)
-            })
-            seen_urls.add(href)
-            new_count += 1
-        except:
-            continue
-
-    print(f"  +{new_count} new links")
-    return rows
 
 def make_session():
     s = requests.Session()
@@ -237,122 +196,125 @@ def extract_transcript(html: str) -> str:
     text = re.sub(r"\s*\(\d+\)\s*", " ", text)
     return clean_text(text)
 
-def build_index() -> list[dict]:
-    """Scrape les pages annuelles et écrit fed_index.csv (avec reprise)."""
-    print(f"→ Building index into {INDEX_CSV}")
-    driver = make_driver()
+def scrape_and_process_speeches():
+    """
+    Scrapes Federal Reserve speeches for a given period and saves all data
+    directly into a single CSV file.
+    """
+    print(f"→ Starting scraper for the period from {START_DATE.strftime('%Y-%m-%d')} to {END_DATE.strftime('%Y-%m-%d')}")
+    print(f"→ Output file will be: {FULL_CSV}")
 
-    seen_urls = set()
-    if INDEX_CSV.exists():
-        with open(INDEX_CSV, "r", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if row.get("url"):
-                    seen_urls.add(row["url"])
-
-    total = 0
-    for year in range(YEAR_START, YEAR_END - 1, -1):
-        if year < MIN_YEAR:
-            break
-        rows = extract_year_index(driver, year, seen_urls)
-
-        keep = []
-        for r in rows:
-            if r["date"]:
-                try:
-                    if datetime.strptime(r["date"], "%Y-%m-%d").year >= MIN_YEAR:
-                        keep.append(r)
-                except:
-                    keep.append(r)
-            else:
-                keep.append(r)
-
-        write_rows(INDEX_CSV, keep, header=["date","title","speaker","url"])
-        total += len(keep)
-        time.sleep(random.uniform(0.6, 1.2))
-
-    driver.quit()
-    print(f"Index done. +{total} rows written.")
-    with open(INDEX_CSV, "r", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-def build_full(index_rows: list[dict]):
-    """Télécharge les discours & écrit fed_speeches_full.csv (reprise intelligente)."""
-    print(f"→ Building full into {FULL_CSV}")
-    done_ok, redo = set(), set()
+    # Resume logic: read already scraped URLs to avoid reprocessing them
+    done_urls = set()
     if FULL_CSV.exists():
         with open(FULL_CSV, "r", encoding="utf-8") as f:
             for r in csv.DictReader(f):
                 url = (r.get("url") or "").strip()
-                if not url: 
-                    continue
+                if not url: continue
                 try:
                     wc = int(r.get("word_count") or 0)
-                except:
-                    wc = 0
-                if wc < REPROCESS_IF_WC_LT:
-                    redo.add(url)
-                else:
-                    done_ok.add(url)
+                    if wc >= REPROCESS_IF_WC_LT:
+                        done_urls.add(url)
+                except ValueError:
+                    continue
+    print(f"Found {len(done_urls)} already processed and valid speeches.")
 
-    if not FULL_CSV.exists():
-        with open(FULL_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=[
-                "date","title","speaker","url","word_count","text"
-            ])
-            w.writeheader()
+    driver = make_driver()
+    session = make_session()
 
-    s = make_session()
-    batch, total = [], 0
-    for r in index_rows:
-        url = (r.get("url") or "").strip()
-        if not url: 
-            continue
-        if url in done_ok:      
-            continue
+    header = ["date", "title", "speaker", "url", "word_count", "text"]
+    batch, total_new_speeches = [], 0
+
+    # Iterate through the years, from most recent to oldest
+    for year in range(END_DATE.year, START_DATE.year - 1, -1):
+        year_url = YEAR_URL.format(year=year)
+        print(f"\n[Indexing Year {year}] {year_url}")
 
         try:
-            resp = s.get(url, timeout=30)
-            resp.raise_for_status()
-            text = extract_transcript(resp.text)
-            wc = count_words(text)
-            row = {
-                "date": r.get("date",""),
-                "title": r.get("title",""),
-                "speaker": r.get("speaker",""),
-                "url": url,
-                "word_count": wc,
-                "text": text
-            }
-            batch.append(row); total += 1
-
-            if len(batch) >= 20:
-                write_rows(FULL_CSV, batch, header=[
-                    "date","title","speaker","url","word_count","text"
-                ])
-                print(f"  wrote {len(batch)} rows (progress {total})")
-                batch = []
-
-            time.sleep(0.15)
+            driver.get(year_url)
+            WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a")))
+            time.sleep(0.5)
         except Exception as e:
-            print(f"[warn] {url} -> {e}")
+            print(f"  [WARNING] Could not load the page for year {year}: {e}")
+            continue
 
+        anchors = driver.find_elements(By.CSS_SELECTOR, "a[href^='/newsevents/speech/'][href$='.htm']")
+
+        for a in anchors:
+            try:
+                href = a.get_attribute("href") or ""
+                if not SPEECH_URL_RE.search(href):
+                    continue
+
+                full_url = urljoin(BASE, href)
+                if full_url in done_urls:
+                    continue
+
+                # --- Date validation ---
+                cont_for_date = nearest_container(a)
+                date_str = parse_date_from_text(cont_for_date.text) or date_from_url(href)
+                if not date_str:
+                    continue
+
+                speech_date = datetime.strptime(date_str, "%Y-%m-%d")
+                if not (START_DATE <= speech_date <= END_DATE):
+                    continue
+
+                # --- If the URL is new and within the date range, process it ---
+                print(f"  > Processing: {full_url}")
+
+                resp = session.get(full_url, timeout=30)
+                resp.raise_for_status()
+
+                text = extract_transcript(resp.text)
+                wc = count_words(text)
+
+                ctx_text = cont_for_date.text if cont_for_date else ""
+
+                row = {
+                    "date": date_str,
+                    "title": (a.text or a.get_attribute("title") or "").strip(),
+                    "speaker": extract_speaker_from_block(ctx_text),
+                    "url": full_url,
+                    "word_count": wc,
+                    "text": text
+                }
+
+                batch.append(row)
+                total_new_speeches += 1
+                done_urls.add(full_url) # Add to set to avoid duplicates within the same session
+
+                # Write in batches to avoid keeping everything in memory
+                if len(batch) >= 20:
+                    write_rows(FULL_CSV, batch, header=header)
+                    print(f"    ...batch of {len(batch)} speeches written to CSV (new total: {total_new_speeches})")
+                    batch = []
+
+                time.sleep(random.uniform(0.1, 0.2))
+
+            except Exception as e:
+                # Ignore errors on a single speech to avoid halting the entire process
+                # print(f"  [WARNING] Error on speech {href}: {e}")
+                continue
+
+    # Write the last batch if any remains
     if batch:
-        write_rows(FULL_CSV, batch, header=[
-            "date","title","speaker","url","word_count","text"
-        ])
-        print(f"  wrote {len(batch)} rows (final)")
+        write_rows(FULL_CSV, batch, header=header)
+        print(f"    ...final batch of {len(batch)} speeches written to CSV (new total: {total_new_speeches})")
 
-    print(f"Full done. New/updated rows: {total}")
+    driver.quit()
+    print(f"\nScraping complete. {total_new_speeches} new speeches were added.")
+
 
 def main():
-    # Étape 1 — index (Selenium)
-    index_rows = build_index()
+    # Optional: to ensure you start from scratch, uncomment the lines below to delete the old file
+    # if FULL_CSV.exists():
+    #     print(f"Deleting old file: {FULL_CSV}")
+    #     os.remove(FULL_CSV)
 
-    # Étape 2 — textes (Requests + BS4)
-    build_full(index_rows)
+    scrape_and_process_speeches()
 
-    print(f"\nCSV index   → {INDEX_CSV}")
-    print(f"CSV full    → {FULL_CSV}")
+    print(f"\nFinal CSV file created/updated at: {FULL_CSV}")
 
 if __name__ == "__main__":
     main()
